@@ -206,3 +206,48 @@ if data_file and rules_file:
                         report.append({"RespondentID": rid, "Question": col,
                                        "Check_Type": "Multi-Select",
                                        "Issue": "Invalid value (not 0/1)"})
+                if len(related_cols) > 0:
+                    offenders = df.loc[df[related_cols].fillna(0).sum(axis=1) == 0, "RespondentID"]
+                    for rid in offenders:
+                        report.append({"RespondentID": rid, "Question": q,
+                                       "Check_Type": "Multi-Select",
+                                       "Issue": "No options selected"})
+
+            # 6️⃣ OpenEnd_Junk
+            elif check_type == "OpenEnd_Junk":
+                related_cols = [q] if q in df.columns else expand_prefix(q, df.columns)
+                for col in related_cols:
+                    junk = df[col].astype(str).str.len() < 3
+                    offenders = df.loc[junk, "RespondentID"]
+                    for rid in offenders:
+                        report.append({"RespondentID": rid, "Question": col,
+                                       "Check_Type": "OpenEnd_Junk",
+                                       "Issue": "Open-end looks like junk/low-effort"})
+
+            # 7️⃣ Duplicate
+            elif check_type == "Duplicate":
+                related_cols = [q] if q in df.columns else expand_prefix(q, df.columns)
+                for col in related_cols:
+                    duplicate_ids = df[df.duplicated(subset=[col], keep=False)]["RespondentID"]
+                    for rid in duplicate_ids:
+                        report.append({"RespondentID": rid, "Question": col,
+                                       "Check_Type": "Duplicate",
+                                       "Issue": "Duplicate value found"})
+
+    # --- Create Report ---
+    report_df = pd.DataFrame(report)
+
+    st.write("### Validation Report (detailed by Respondent)")
+    st.dataframe(report_df)
+
+    # --- Download Report ---
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        report_df.to_excel(writer, index=False, sheet_name="Validation Report")
+
+    st.download_button(
+        label="Download Validation Report",
+        data=output.getvalue(),
+        file_name="validation_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
