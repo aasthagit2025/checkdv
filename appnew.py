@@ -4,7 +4,7 @@ import pyreadstat
 import io
 import re
 
-st.title("📊 Survey Data Validation Tool — Combined Rule Support")
+st.title("📊 Survey Data Validation Tool — Enhanced Skip Handling with Tabs")
 
 # --- File Upload ---
 data_file = st.file_uploader("Upload survey data (CSV, Excel, or SAV)", type=["csv", "xlsx", "sav"])
@@ -30,7 +30,6 @@ if data_file and rules_file:
 
     # --- Load Rules ---
     rules_df = pd.read_excel(rules_file)
-
     report = []
 
     # --- Utility Functions ---
@@ -49,40 +48,52 @@ if data_file and rules_file:
         return [expr] if expr in df_cols else []
 
     def get_condition_mask(cond_text, df):
-        """Parse logical conditions like If A1=1 and B2>3"""
+        """Parse logical conditions like: If A1=1 and B2>3"""
         cond_text = cond_text.strip()
         if cond_text.lower().startswith("if"):
             cond_text = cond_text[2:].strip()
+
         or_groups = re.split(r'\s+or\s+', cond_text, flags=re.IGNORECASE)
         mask = pd.Series(False, index=df.index)
+
         for or_group in or_groups:
             and_parts = re.split(r'\s+and\s+', or_group, flags=re.IGNORECASE)
             sub_mask = pd.Series(True, index=df.index)
+
             for part in and_parts:
                 part = part.strip().replace("<>", "!=")
+                matched = False
                 for op in ["<=", ">=", "!=", "<", ">", "="]:
                     if op in part:
                         col, val = [p.strip() for p in part.split(op, 1)]
                         if col not in df.columns:
                             sub_mask &= False
+                            matched = True
                             break
+                        col_vals = df[col]
                         try:
-                            val = float(val)
-                            col_vals = pd.to_numeric(df[col], errors="coerce")
+                            val_num = float(val)
+                            col_vals_num = pd.to_numeric(col_vals, errors='coerce')
                             if op == "<=":
-                                sub_mask &= col_vals <= val
+                                sub_mask &= col_vals_num <= val_num
                             elif op == ">=":
-                                sub_mask &= col_vals >= val
+                                sub_mask &= col_vals_num >= val_num
                             elif op == "<":
-                                sub_mask &= col_vals < val
+                                sub_mask &= col_vals_num < val_num
                             elif op == ">":
-                                sub_mask &= col_vals > val
-                        except ValueError:
-                            if op in ["!=", "<>"]:
-                                sub_mask &= df[col].astype(str).str.strip() != str(val)
+                                sub_mask &= col_vals_num > val_num
                             elif op == "=":
-                                sub_mask &= df[col].astype(str).str.strip() == str(val)
+                                sub_mask &= col_vals_num == val_num
+                        except ValueError:
+                            val_str = str(val)
+                            if op in ["!=", "<>"]:
+                                sub_mask &= col_vals.astype(str).str.strip() != val_str
+                            elif op == "=":
+                                sub_mask &= col_vals.astype(str).str.strip() == val_str
+                        matched = True
                         break
+                if not matched:
+                    sub_mask &= False
             mask |= sub_mask
         return mask
 
@@ -95,7 +106,10 @@ if data_file and rules_file:
         related_cols = [q] if q in df.columns else expand_prefix(q, df.columns)
         skip_mask = None
 
-        # --- First, process Skip checks ---
+        # --- Step 1: Evaluate Skip first ---
+        skip_errors = []
+        other_errors = []
+
         if "skip" in check_types:
             i = check_types.index("skip")
             condition = conditions[i] if i < len(conditions) else ""
@@ -116,27 +130,28 @@ if data_file and rules_file:
 
                 for col in target_cols:
                     if col not in df.columns:
-                        report.append({id_col: None, "Question": q, "Check_Type": "Skip", "Issue": f"Target variable '{col}' not found"})
+                        skip_errors.append({id_col: None, "Question": q, "Check_Type": "Skip", "Issue": f"Target variable '{col}' not found"})
                         continue
                     blank_mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
                     not_blank_mask = ~blank_mask
-                    if should_be_blank:
-                        offenders = df.loc[skip_mask & not_blank_mask, id_col]
-                        for rid in offenders:
-                            report.append({id_col: rid, "Question": col, "Check_Type": "Skip", "Issue": "Answered but should be blank"})
-                    else:
-                        offenders = df.loc[skip_mask & blank_mask, id_col]
-                        for rid in offenders:
-                            report.append({id_col: rid, "Question": col, "Check_Type": "Skip", "Issue": "Blank but should be answered"})
-            except Exception as e:
-                report.append({id_col: None, "Question": q, "Check_Type": "Skip", "Issue": f"Invalid skip rule: {e}"})
 
-        # --- Process other checks only for non-skipped rows ---
+                    offenders_answered = df.loc[skip_mask & blank_mask, id_col]
+                    offenders_skipped = df.loc[~skip_mask & not_blank_mask, id_col]
+
+                    for rid in offenders_answered:
+                        skip_errors.append({id_col: rid, "Question": col, "Check_Type": "Skip", "Issue": "Blank but should be answered"})
+                    for rid in offenders_skipped:
+                        skip_errors.append({id_col: rid, "Question": col, "Check_Type": "Skip", "Issue": "Answered but should be blank"})
+            except Exception as e:
+                skip_errors.append({id_col: None, "Question": q, "Check_Type": "Skip", "Issue": f"Invalid skip rule: {e}"})
+
+        # --- Step 2: Evaluate other checks only for respondents who should answer ---
+        rows_to_check = skip_mask if skip_mask is not None else pd.Series(True, index=df.index)
+
         for i, check_type in enumerate(check_types):
             if check_type == "skip":
                 continue
             condition = conditions[i] if i < len(conditions) else ""
-            rows_to_check = ~skip_mask if skip_mask is not None else pd.Series(True, index=df.index)
 
             if check_type == "range":
                 try:
@@ -146,16 +161,16 @@ if data_file and rules_file:
                         valid_mask = col_vals.between(min_val, max_val)
                         offenders = df.loc[rows_to_check & ~valid_mask, id_col]
                         for rid in offenders:
-                            report.append({id_col: rid, "Question": col, "Check_Type": "Range", "Issue": f"Value out of range ({min_val}-{max_val})"})
+                            other_errors.append({id_col: rid, "Question": col, "Check_Type": "Range", "Issue": f"Value out of range ({min_val}-{max_val})"})
                 except Exception:
-                    report.append({id_col: None, "Question": q, "Check_Type": "Range", "Issue": f"Invalid range format ({condition})"})
+                    other_errors.append({id_col: None, "Question": q, "Check_Type": "Range", "Issue": f"Invalid range format ({condition})"})
 
             elif check_type == "missing":
                 for col in related_cols:
                     blank_mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
                     offenders = df.loc[rows_to_check & blank_mask, id_col]
                     for rid in offenders:
-                        report.append({id_col: rid, "Question": col, "Check_Type": "Missing", "Issue": "Value is missing"})
+                        other_errors.append({id_col: rid, "Question": col, "Check_Type": "Missing", "Issue": "Value is missing"})
 
             elif check_type == "straightliner":
                 if len(related_cols) == 1:
@@ -164,39 +179,51 @@ if data_file and rules_file:
                     same_resp = df[related_cols].nunique(axis=1) == 1
                     offenders = df.loc[rows_to_check & same_resp, id_col]
                     for rid in offenders:
-                        report.append({id_col: rid, "Question": ",".join(related_cols), "Check_Type": "Straightliner", "Issue": "Same response across all items"})
+                        other_errors.append({id_col: rid, "Question": ",".join(related_cols), "Check_Type": "Straightliner", "Issue": "Same response across all items"})
 
             elif check_type == "multi-select":
                 related_cols = expand_prefix(q, df.columns)
                 offenders = df.loc[rows_to_check & (df[related_cols].fillna(0).sum(axis=1) == 0), id_col]
                 for rid in offenders:
-                    report.append({id_col: rid, "Question": q, "Check_Type": "Multi-Select", "Issue": "No options selected"})
+                    other_errors.append({id_col: rid, "Question": q, "Check_Type": "Multi-Select", "Issue": "No options selected"})
 
             elif check_type == "openend_junk":
                 for col in related_cols:
                     junk = df[col].astype(str).str.len() < 3
                     offenders = df.loc[rows_to_check & junk, id_col]
                     for rid in offenders:
-                        report.append({id_col: rid, "Question": col, "Check_Type": "OpenEnd_Junk", "Issue": "Open-end looks like junk"})
+                        other_errors.append({id_col: rid, "Question": col, "Check_Type": "OpenEnd_Junk", "Issue": "Open-end looks like junk"})
 
             elif check_type == "duplicate":
                 for col in related_cols:
                     dupes = df.loc[rows_to_check & df.duplicated(subset=[col], keep=False), id_col]
                     for rid in dupes:
-                        report.append({id_col: rid, "Question": col, "Check_Type": "Duplicate", "Issue": "Duplicate value found"})
+                        other_errors.append({id_col: rid, "Question": col, "Check_Type": "Duplicate", "Issue": "Duplicate value found"})
 
-    # --- Final Report ---
-    report_df = pd.DataFrame(report)
-    st.success(f"Validation completed! Total issues found: {len(report_df)}")
-    st.dataframe(report_df)
+    # --- Convert reports to DataFrames ---
+    skip_df = pd.DataFrame(skip_errors)
+    other_df = pd.DataFrame(other_errors)
 
-    # --- Download Report ---
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        report_df.to_excel(writer, index=False, sheet_name="Validation Report")
-    st.download_button(
-        label="📥 Download Validation Report",
-        data=out.getvalue(),
-        file_name="validation_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    # --- Tabs ---
+    tab1, tab2 = st.tabs(["Skip Errors", "Other Errors"])
+    with tab1:
+        st.subheader("Skip Validation Issues")
+        st.write(f"Total skip errors: {len(skip_df)}")
+        st.dataframe(skip_df)
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            skip_df.to_excel(writer, index=False, sheet_name="Skip Errors")
+        st.download_button("📥 Download Skip Errors", data=out.getvalue(),
+                           file_name="skip_errors.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    with tab2:
+        st.subheader("Range / Missing / Other Issues")
+        st.write(f"Total other errors: {len(other_df)}")
+        st.dataframe(other_df)
+        out2 = io.BytesIO()
+        with pd.ExcelWriter(out2, engine="openpyxl") as writer:
+            other_df.to_excel(writer, index=False, sheet_name="Other Errors")
+        st.download_button("📥 Download Other Errors", data=out2.getvalue(),
+                           file_name="other_errors.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
