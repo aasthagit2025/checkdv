@@ -4,10 +4,10 @@ import pyreadstat
 import io
 import re
 
-st.title("📊 Survey Data Validation Tool")
+st.title("📊 Survey Data Validation Tool — Combined Rule Support")
 
 # --- File Upload ---
-data_file = st.file_uploader("Upload your survey data file (CSV, Excel, or SPSS)", type=["csv", "xlsx", "sav"])
+data_file = st.file_uploader("Upload survey data (CSV, Excel, or SAV)", type=["csv", "xlsx", "sav"])
 rules_file = st.file_uploader("Upload validation rules (Excel)", type=["xlsx"])
 
 if data_file and rules_file:
@@ -22,12 +22,20 @@ if data_file and rules_file:
         st.error("Unsupported file type")
         st.stop()
 
+    # Identify ID column
+    id_col = next((c for c in ["RespondentID", "Password", "RespID", "RID"] if c in df.columns), None)
+    if not id_col:
+        st.error("No respondent ID column found (expected 'RespondentID' or 'Password').")
+        st.stop()
+
     # --- Load Rules ---
     rules_df = pd.read_excel(rules_file)
-
     report = []
 
-    # --- Utilities ---
+    # --- Utility Functions ---
+    def expand_prefix(prefix, df_cols):
+        return [c for c in df_cols if c.startswith(prefix)]
+
     def expand_range(expr, df_cols):
         expr = expr.strip()
         if "to" in expr:
@@ -36,18 +44,15 @@ if data_file and rules_file:
             base2 = re.match(r"([A-Za-z0-9_]+?)(\d+)$", end)
             if base and base2 and base.group(1) == base2.group(1):
                 prefix = base.group(1)
-                start_num, end_num = int(base.group(2)), int(base2.group(2))
-                return [f"{prefix}{i}" for i in range(start_num, end_num + 1) if f"{prefix}{i}" in df_cols]
+                return [f"{prefix}{i}" for i in range(int(base.group(2)), int(base2.group(2)) + 1) if f"{prefix}{i}" in df_cols]
         return [expr] if expr in df_cols else []
 
-    def expand_prefix(prefix, df_cols):
-        return [c for c in df_cols if c.startswith(prefix)]
-
-    def get_skip_mask(condition_text, df):
-        condition_text = condition_text.strip()
-        if condition_text.lower().startswith("if"):
-            condition_text = condition_text[2:].strip()
-        or_groups = re.split(r'\s+or\s+', condition_text, flags=re.IGNORECASE)
+    def get_condition_mask(cond_text, df):
+        """Parse logical conditions like If A1=1 and B2>3"""
+        cond_text = cond_text.strip()
+        if cond_text.lower().startswith("if"):
+            cond_text = cond_text[2:].strip()
+        or_groups = re.split(r'\s+or\s+', cond_text, flags=re.IGNORECASE)
         mask = pd.Series(False, index=df.index)
         for or_group in or_groups:
             and_parts = re.split(r'\s+and\s+', or_group, flags=re.IGNORECASE)
@@ -60,105 +65,152 @@ if data_file and rules_file:
                         if col not in df.columns:
                             sub_mask &= False
                             break
-                        if op in ["<=", ">=", "<", ">"]:
+                        try:
                             val = float(val)
                             col_vals = pd.to_numeric(df[col], errors="coerce")
-                            if op == "<=": sub_mask &= col_vals <= val
-                            elif op == ">=": sub_mask &= col_vals >= val
-                            elif op == "<": sub_mask &= col_vals < val
-                            elif op == ">": sub_mask &= col_vals > val
-                        elif op in ["!=", "<>"]:
-                            sub_mask &= df[col].astype(str).str.strip() != str(val)
-                        elif op == "=":
-                            sub_mask &= df[col].astype(str).str.strip() == str(val)
+                            if op == "<=":
+                                sub_mask &= col_vals <= val
+                            elif op == ">=":
+                                sub_mask &= col_vals >= val
+                            elif op == "<":
+                                sub_mask &= col_vals < val
+                            elif op == ">":
+                                sub_mask &= col_vals > val
+                        except ValueError:
+                            if op in ["!=", "<>"]:
+                                sub_mask &= df[col].astype(str).str.strip() != str(val)
+                            elif op == "=":
+                                sub_mask &= df[col].astype(str).str.strip() == str(val)
                         break
             mask |= sub_mask
         return mask
 
-    # --- Main Loop ---
+    # --- Main Validation Loop ---
     for _, rule in rules_df.iterrows():
         q = str(rule["Question"]).strip()
-        check_types = [c.strip().lower() for c in str(rule["Check_Type"]).split(";")]
-        conditions = [c.strip() for c in str(rule.get("Condition", "")).split(";")]
+        check_types = [x.strip().lower() for x in str(rule["Check_Type"]).split(";")]
+        conditions = [x.strip() for x in str(rule["Condition"]).split(";")]
+
         related_cols = [q] if q in df.columns else expand_prefix(q, df.columns)
-
-        # Determine skip mask if present
         skip_mask = None
-        if "skip" in check_types:
-            skip_index = check_types.index("skip")
-            condition = conditions[skip_index]
-            if "then" in condition.lower():
-                if_part, then_part = condition.split("then", 1)
-                skip_mask = get_skip_mask(if_part, df)
 
-                then_expr = then_part.strip().split()[0]
-                if "to" in then_part:
-                    skip_target_cols = expand_range(then_part, df.columns)
-                elif then_expr.endswith("_"):
-                    skip_target_cols = expand_prefix(then_expr, df.columns)
-                else:
-                    skip_target_cols = [then_expr]
+        for i, check_type in enumerate(check_types):
+            condition = conditions[i] if i < len(conditions) else ""
 
-                for col in skip_target_cols:
-                    if col not in df.columns:
-                        report.append({
-                            "RespondentID": None,
-                            "Question": col,
-                            "Check_Type": "Skip",
-                            "Issue": f"Skip condition references missing variable '{col}'"
-                        })
-                        continue
-                    blank_mask = (df[col].isna() | (df[col].astype(str).str.strip() == "")) & skip_mask
-                    offenders = df.loc[blank_mask, "RespondentID"]
-                    for rid in offenders:
-                        report.append({"RespondentID": rid, "Question": col,
-                                       "Check_Type": "Skip",
-                                       "Issue": "Blank but should be answered"})
-                    answered_mask = (~df[col].isna() & (df[col].astype(str).str.strip() != "")) & (~skip_mask)
-                    offenders = df.loc[answered_mask, "RespondentID"]
-                    for rid in offenders:
-                        report.append({"RespondentID": rid, "Question": col,
-                                       "Check_Type": "Skip",
-                                       "Issue": "Answered but should be skipped"})
-
-        # Apply Range checks only to respondents who should answer
-        if "range" in check_types:
-            range_index = check_types.index("range")
-            condition = conditions[range_index]
-            for col in related_cols:
+            # --- Skip ---
+            if check_type == "skip":
                 try:
-                    if "-" not in str(condition):
-                        raise ValueError("Not a valid range format")
-                    min_val, max_val = map(float, condition.split("-"))
-                    effective_mask = skip_mask if skip_mask is not None else pd.Series(True, index=df.index)
-                    out_of_range_mask = ~df[col].between(min_val, max_val) & effective_mask
-                    offenders = df.loc[out_of_range_mask, "RespondentID"]
-                    for rid in offenders:
-                        report.append({"RespondentID": rid, "Question": col,
-                                       "Check_Type": "Range",
-                                       "Issue": f"Value out of range ({min_val}-{max_val})"})
+                    if "then" not in condition.lower():
+                        raise ValueError("Invalid skip format")
+                    if_part, then_part = re.split(r'(?i)then', condition, maxsplit=1)
+                    skip_mask = get_condition_mask(if_part, df)
+                    then_expr = then_part.strip().split()[0]
+                    should_be_blank = "blank" in then_part.lower()
+
+                    if "to" in then_part:
+                        target_cols = expand_range(then_part, df.columns)
+                    elif then_expr.endswith("_"):
+                        target_cols = expand_prefix(then_expr, df.columns)
+                    else:
+                        target_cols = [then_expr]
+
+                    for col in target_cols:
+                        if col not in df.columns:
+                            report.append({id_col: None, "Question": q, "Check_Type": "Skip",
+                                           "Issue": f"Target variable '{col}' not found"})
+                            continue
+
+                        blank_mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
+                        not_blank_mask = ~blank_mask
+                        if should_be_blank:
+                            offenders = df.loc[skip_mask & not_blank_mask, id_col]
+                            for rid in offenders:
+                                report.append({id_col: rid, "Question": col, "Check_Type": "Skip",
+                                               "Issue": "Answered but should be blank"})
+                        else:
+                            offenders = df.loc[skip_mask & blank_mask, id_col]
+                            for rid in offenders:
+                                report.append({id_col: rid, "Question": col, "Check_Type": "Skip",
+                                               "Issue": "Blank but should be answered"})
+                except Exception as e:
+                    report.append({id_col: None, "Question": q, "Check_Type": "Skip",
+                                   "Issue": f"Invalid skip rule: {e}"})
+
+            # --- Range ---
+            elif check_type == "range":
+                try:
+                    min_val, max_val = map(float, condition.replace("to", "-").split("-"))
+                    for col in related_cols:
+                        valid_mask = pd.to_numeric(df[col], errors="coerce").between(min_val, max_val)
+                        if skip_mask is not None:
+                            valid_mask |= ~skip_mask
+                        offenders = df.loc[~valid_mask, id_col]
+                        for rid in offenders:
+                            report.append({id_col: rid, "Question": col, "Check_Type": "Range",
+                                           "Issue": f"Value out of range ({min_val}-{max_val})"})
                 except Exception:
-                    report.append({"RespondentID": None, "Question": col,
-                                   "Check_Type": "Range",
-                                   "Issue": f"Invalid range condition ({condition})"})
+                    report.append({id_col: None, "Question": q, "Check_Type": "Range",
+                                   "Issue": f"Invalid range format ({condition})"})
 
-        # --- Other Checks Placeholder ---
-        # Straightliner, Missing, Multi-Select, OpenEnd_Junk, Duplicate
-        # (implement as per your previous logic if needed)
+            # --- Missing ---
+            elif check_type == "missing":
+                for col in related_cols:
+                    blank_mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
+                    offenders = df.loc[blank_mask, id_col]
+                    for rid in offenders:
+                        report.append({id_col: rid, "Question": col,
+                                       "Check_Type": "Missing", "Issue": "Value is missing"})
 
-    # --- Create Report ---
+            # --- Straightliner ---
+            elif check_type == "straightliner":
+                if len(related_cols) == 1:
+                    related_cols = expand_prefix(related_cols[0], df.columns)
+                if len(related_cols) > 1:
+                    same_resp = df[related_cols].nunique(axis=1) == 1
+                    offenders = df.loc[same_resp, id_col]
+                    for rid in offenders:
+                        report.append({id_col: rid, "Question": ",".join(related_cols),
+                                       "Check_Type": "Straightliner",
+                                       "Issue": "Same response across all items"})
+
+            # --- Multi-Select ---
+            elif check_type == "multi-select":
+                related_cols = expand_prefix(q, df.columns)
+                offenders = df.loc[df[related_cols].fillna(0).sum(axis=1) == 0, id_col]
+                for rid in offenders:
+                    report.append({id_col: rid, "Question": q,
+                                   "Check_Type": "Multi-Select", "Issue": "No options selected"})
+
+            # --- OpenEnd Junk ---
+            elif check_type == "openend_junk":
+                for col in related_cols:
+                    junk = df[col].astype(str).str.len() < 3
+                    offenders = df.loc[junk, id_col]
+                    for rid in offenders:
+                        report.append({id_col: rid, "Question": col,
+                                       "Check_Type": "OpenEnd_Junk", "Issue": "Open-end looks like junk"})
+
+            # --- Duplicate ---
+            elif check_type == "duplicate":
+                for col in related_cols:
+                    dupes = df[df.duplicated(subset=[col], keep=False)][id_col]
+                    for rid in dupes:
+                        report.append({id_col: rid, "Question": col,
+                                       "Check_Type": "Duplicate", "Issue": "Duplicate value found"})
+
+    # --- Final Report ---
     report_df = pd.DataFrame(report)
-    st.write("### Validation Report (detailed by Respondent)")
+    st.success(f"Validation completed! Total issues found: {len(report_df)}")
     st.dataframe(report_df)
 
     # --- Download Report ---
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
         report_df.to_excel(writer, index=False, sheet_name="Validation Report")
 
     st.download_button(
-        label="Download Validation Report",
-        data=output.getvalue(),
+        label="📥 Download Validation Report",
+        data=out.getvalue(),
         file_name="validation_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
