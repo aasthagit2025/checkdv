@@ -4,7 +4,7 @@ import pyreadstat
 import io
 import re
 
-st.title("📊 Survey Data Validation Tool — Enhanced Skip + Range Logic (Case-Insensitive Open-End)")
+st.title("📊 Survey Data Validation Tool — Enhanced Skip + Range Logic")
 
 # --- File Upload ---
 data_file = st.file_uploader("Upload survey data (CSV, Excel, or SAV)", type=["csv", "xlsx", "sav"])
@@ -34,9 +34,11 @@ if data_file and rules_file:
 
     # --- Utility Functions ---
     def expand_prefix(prefix, df_cols):
+        """Find all columns that start with a given prefix (e.g., Q2_ → Q2_1, Q2_2...)"""
         return [c for c in df_cols if c.startswith(prefix)]
 
     def expand_range(expr, df_cols):
+        """Handle range expressions like Q1_1 to Q1_5"""
         expr = expr.strip()
         if "to" in expr:
             start, end = [x.strip() for x in expr.split("to")]
@@ -48,6 +50,7 @@ if data_file and rules_file:
         return [expr] if expr in df_cols else []
 
     def get_condition_mask(cond_text, df):
+        """Parse logical expressions like If A1=1 and B2>3"""
         cond_text = cond_text.strip()
         if cond_text.lower().startswith("if"):
             cond_text = cond_text[2:].strip()
@@ -78,29 +81,17 @@ if data_file and rules_file:
                             elif op == ">": sub_mask &= col_vals > val_num
                             elif op == "=": sub_mask &= col_vals == val_num
                         except ValueError:
-                            val_str = str(val).upper()
-                            col_vals_str = df[col].astype(str).str.strip().str.upper()
+                            val_str = str(val)
                             if op in ["!=", "<>"]:
-                                sub_mask &= col_vals_str != val_str
+                                sub_mask &= df[col].astype(str).str.strip() != val_str
                             elif op == "=":
-                                sub_mask &= col_vals_str == val_str
+                                sub_mask &= df[col].astype(str).str.strip() == val_str
                         matched = True
                         break
                 if not matched:
                     sub_mask &= False
             mask |= sub_mask
         return mask
-
-    # --- Open-end acceptable codes (case-insensitive) ---
-    OPENEND_ACCEPTABLE = ["NA", "N/A", "NONE", "NOTHING"]
-
-    def is_blank_openend(series):
-        """
-        Returns True if the response is considered missing for open-end questions.
-        Treats NA, N/A, none, nothing (any capitalization) as valid answers.
-        """
-        s = series.astype(str).str.strip().str.upper()
-        return s.isna() | ((s == "") & (~s.isin(OPENEND_ACCEPTABLE)))
 
     # --- Main Validation Loop ---
     for _, rule in rules_df.iterrows():
@@ -133,7 +124,7 @@ if data_file and rules_file:
                     if col not in df.columns:
                         report.append({id_col: None, "Question": q, "Check_Type": "Skip", "Issue": f"Target variable '{col}' not found"})
                         continue
-                    blank_mask = is_blank_openend(df[col])
+                    blank_mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
                     not_blank_mask = ~blank_mask
 
                     # Respondent SHOULD answer
@@ -149,7 +140,7 @@ if data_file and rules_file:
             except Exception as e:
                 report.append({id_col: None, "Question": q, "Check_Type": "Skip", "Issue": f"Invalid skip rule: {e}"})
 
-        # --- Step 2: Other Checks ---
+        # --- Step 2: Other Checks (only apply where skip allows) ---
         rows_to_check = skip_mask if skip_mask is not None else pd.Series(True, index=df.index)
 
         for i, check_type in enumerate(check_types):
@@ -157,6 +148,7 @@ if data_file and rules_file:
                 continue
             condition = conditions[i] if i < len(conditions) else ""
 
+            # --- Range Check (fixed to exclude blanks) ---
             if check_type == "range":
                 try:
                     min_val, max_val = map(float, condition.replace("to", "-").split("-"))
@@ -173,7 +165,7 @@ if data_file and rules_file:
 
             elif check_type == "missing":
                 for col in related_cols:
-                    blank_mask = is_blank_openend(df[col])
+                    blank_mask = df[col].isna() | (df[col].astype(str).str.strip() == "")
                     offenders = df.loc[rows_to_check & blank_mask, id_col]
                     for rid in offenders:
                         report.append({id_col: rid, "Question": col, "Check_Type": "Missing", "Issue": "Value is missing"})
@@ -195,7 +187,7 @@ if data_file and rules_file:
 
             elif check_type == "openend_junk":
                 for col in related_cols:
-                    junk = (df[col].astype(str).str.strip().str.len() < 3) & (~df[col].astype(str).str.strip().str.upper().isin(OPENEND_ACCEPTABLE))
+                    junk = df[col].astype(str).str.len() < 3
                     offenders = df.loc[rows_to_check & junk, id_col]
                     for rid in offenders:
                         report.append({id_col: rid, "Question": col, "Check_Type": "OpenEnd_Junk", "Issue": "Open-end looks like junk"})
