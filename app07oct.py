@@ -4,7 +4,7 @@ import pyreadstat
 import io
 import re
 
-st.title("📊 Survey Data Validation Tool — Enhanced Skip + Range Logic")
+st.title("📊 Survey Data Validation Tool — Enhanced Skip + Range Logic (Case-Insensitive Open-End)")
 
 # --- File Upload ---
 data_file = st.file_uploader("Upload survey data (CSV, Excel, or SAV)", type=["csv", "xlsx", "sav"])
@@ -78,11 +78,12 @@ if data_file and rules_file:
                             elif op == ">": sub_mask &= col_vals > val_num
                             elif op == "=": sub_mask &= col_vals == val_num
                         except ValueError:
-                            val_str = str(val)
+                            val_str = str(val).upper()
+                            col_vals_str = df[col].astype(str).str.strip().str.upper()
                             if op in ["!=", "<>"]:
-                                sub_mask &= df[col].astype(str).str.strip() != val_str
+                                sub_mask &= col_vals_str != val_str
                             elif op == "=":
-                                sub_mask &= df[col].astype(str).str.strip() == val_str
+                                sub_mask &= col_vals_str == val_str
                         matched = True
                         break
                 if not matched:
@@ -90,13 +91,16 @@ if data_file and rules_file:
             mask |= sub_mask
         return mask
 
-    # --- Open-end acceptable codes ---
-    OPENEND_ACCEPTABLE = ["NA", "N/A", "n/a", "none", "nothing"]
+    # --- Open-end acceptable codes (case-insensitive) ---
+    OPENEND_ACCEPTABLE = ["NA", "N/A", "NONE", "NOTHING"]
 
     def is_blank_openend(series):
-        """Returns True if the response is considered missing for open-end question"""
-        return series.isna() | (~series.astype(str).str.strip().replace("", pd.NA).notna()) & \
-               (~series.astype(str).str.strip().isin(OPENEND_ACCEPTABLE))
+        """
+        Returns True if the response is considered missing for open-end questions.
+        Treats NA, N/A, none, nothing (any capitalization) as valid answers.
+        """
+        s = series.astype(str).str.strip().str.upper()
+        return s.isna() | ((s == "") & (~s.isin(OPENEND_ACCEPTABLE)))
 
     # --- Main Validation Loop ---
     for _, rule in rules_df.iterrows():
@@ -145,7 +149,7 @@ if data_file and rules_file:
             except Exception as e:
                 report.append({id_col: None, "Question": q, "Check_Type": "Skip", "Issue": f"Invalid skip rule: {e}"})
 
-        # --- Step 2: Other Checks (only apply where skip allows) ---
+        # --- Step 2: Other Checks ---
         rows_to_check = skip_mask if skip_mask is not None else pd.Series(True, index=df.index)
 
         for i, check_type in enumerate(check_types):
@@ -153,7 +157,6 @@ if data_file and rules_file:
                 continue
             condition = conditions[i] if i < len(conditions) else ""
 
-            # --- Range Check ---
             if check_type == "range":
                 try:
                     min_val, max_val = map(float, condition.replace("to", "-").split("-"))
@@ -192,8 +195,7 @@ if data_file and rules_file:
 
             elif check_type == "openend_junk":
                 for col in related_cols:
-                    # Ignore acceptable NA codes when checking junk
-                    junk = df[col].astype(str).str.len() < 3 & ~df[col].astype(str).str.strip().isin(OPENEND_ACCEPTABLE)
+                    junk = (df[col].astype(str).str.strip().str.len() < 3) & (~df[col].astype(str).str.strip().str.upper().isin(OPENEND_ACCEPTABLE))
                     offenders = df.loc[rows_to_check & junk, id_col]
                     for rid in offenders:
                         report.append({id_col: rid, "Question": col, "Check_Type": "OpenEnd_Junk", "Issue": "Open-end looks like junk"})
